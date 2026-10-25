@@ -417,6 +417,7 @@ pub const BatchingProcessor = struct {
         result.parent_span_id = span.parent_span_id;
         result.status = span.status;
         result.is_recording = span.is_recording;
+        result.resource = span.resource;
 
         result.attributes = try cloneAttributes(allocator, span.attributes);
 
@@ -846,4 +847,29 @@ test "BatchingProcessor queued span owns its TraceState" {
     trace_state.deinit();
 
     try std.testing.expectEqualStrings("00f067aa0ba902b7", queued.span_context.trace_state.get("rojo").?);
+}
+
+test "BatchingProcessor cloneSpan preserves resource" {
+    const allocator = std.testing.allocator;
+
+    const resource = [_]attribute.Attribute{
+        .{ .key = "service.name", .value = .{ .string = "test-service" } },
+    };
+
+    const span_context = trace.SpanContext.init(
+        trace.TraceID.init([16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }),
+        trace.SpanID.init([8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }),
+        trace.TraceFlags.sampled(),
+        trace.TraceState.init(allocator),
+        false,
+    );
+    var span = trace.Span.init(allocator, span_context, "test-span", .Internal, .{ .name = "test" });
+    span.resource = &resource;
+
+    var queued = try BatchingProcessor.cloneSpan(allocator, span);
+    defer queued.deinit();
+
+    try std.testing.expect(queued.resource != null);
+    try std.testing.expectEqualStrings("service.name", queued.resource.?[0].key);
+    try std.testing.expectEqualStrings("test-service", queued.resource.?[0].value.string);
 }
