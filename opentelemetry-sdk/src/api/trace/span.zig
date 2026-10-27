@@ -438,18 +438,28 @@ pub const Span = struct {
         try self.links.append(self.allocator, link);
     }
 
-    /// Set the status of the Span
+    /// Set the status of the Span according to the OpenTelemetry specification:
+    /// - An attempt to set value Unset is ignored.
+    /// - Ok takes precedence over Error and cannot be overwritten.
+    /// - Description is only used when StatusCode is Error.
     pub fn setStatus(self: *Self, status: Status) void {
         if (!self.is_recording) return;
 
-        // Status can only be set to Ok if it wasn't already set to Ok
+        // An attempt to set value Unset SHOULD be ignored.
+        if (status.code == .Unset) return;
+
+        // Ok takes precedence over Error and cannot be overwritten.
         if (self.status) |current_status| {
             if (current_status.code == .Ok) {
-                return; // Ignore attempts to change from Ok
+                return;
             }
         }
 
-        self.status = status;
+        // Description MUST only be used when StatusCode is Error.
+        self.status = if (status.code == .Ok)
+            Status.ok()
+        else
+            status;
     }
 
     /// Update the name of the Span
@@ -854,4 +864,59 @@ test "TraceState append validates keys and values" {
     try std.testing.expectError(error.InvalidTraceStateKey, state.append("Key", "value"));
     try std.testing.expectError(error.InvalidTraceStateValue, state.append("key", "val,ue"));
     try std.testing.expectEqual(@as(usize, 0), state.entries.count());
+}
+
+test "Span.setStatus follows OpenTelemetry specification precedence" {
+    const allocator = std.testing.allocator;
+
+    const span_context = SpanContext.init(
+        trace.TraceID.init([16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }),
+        trace.SpanID.init([8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }),
+        trace.TraceFlags.sampled(),
+        TraceState.init(allocator),
+        false,
+    );
+    var span = Span.init(allocator, span_context, "test-span", .Internal, .{ .name = "test" });
+    defer span.deinit();
+
+    // Default status is null (representing Unset)
+    try std.testing.expect(span.status == null);
+
+    // Attempting to set Unset is ignored
+    span.setStatus(Status.unset());
+    try std.testing.expect(span.status == null);
+
+    // Setting Error sets the status and description
+    span.setStatus(Status.error_with_description("initial error"));
+    try std.testing.expect(span.status != null);
+    try std.testing.expectEqual(.Error, span.status.?.code);
+    try std.testing.expectEqualStrings("initial error", span.status.?.description);
+
+    // Calling setStatus(Unset) does not overwrite Error
+    span.setStatus(Status.unset());
+    try std.testing.expectEqual(.Error, span.status.?.code);
+    try std.testing.expectEqualStrings("initial error", span.status.?.description);
+
+    // Calling setStatus(Error) with a new description updates the error
+    span.setStatus(Status.error_with_description("updated error"));
+    try std.testing.expectEqual(.Error, span.status.?.code);
+    try std.testing.expectEqualStrings("updated error", span.status.?.description);
+
+    // Setting Ok takes precedence and overwrites Error, ignoring any description
+    span.setStatus(Status{ .code = .Ok, .description = "ok description should be ignored" });
+    try std.testing.expectEqual(.Ok, span.status.?.code);
+    try std.testing.expectEqualStrings("", span.status.?.description);
+
+    // Subsequent attempts to set Error or Unset are ignored once status is Ok
+    span.setStatus(Status.error_with_description("cannot overwrite ok"));
+    try std.testing.expectEqual(.Ok, span.status.?.code);
+
+    span.setStatus(Status.unset());
+    try std.testing.expectEqual(.Ok, span.status.?.code);
+
+    // Ending the span makes it non-recording, so setStatus is ignored
+    span.end(null);
+    try std.testing.expect(!span.isRecording());
+    span.setStatus(Status.error_with_description("after end"));
+    try std.testing.expectEqual(.Ok, span.status.?.code);
 }
