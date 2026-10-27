@@ -93,6 +93,7 @@ pub fn ObservableInstrument(K: Kind) type {
                 /// List of functions that will produce data points when called.
                 /// Functions are called by the Meter when it observes the instrument (e.g. when Metricreader collects metrics).
                 callbacks: ?[]ObserveMeasures = null,
+                callbacks_capacity: usize = 0,
                 context: ObservedContext,
 
                 pub fn init(allocator: std.mem.Allocator, io: std.Io, ctx: ?ObservedContext) Self {
@@ -104,7 +105,11 @@ pub fn ObservableInstrument(K: Kind) type {
                 }
 
                 pub fn deinit(self: *Self) void {
-                    if (self.callbacks) |c| self.allocator.free(c);
+                    if (self.callbacks) |c| {
+                        self.allocator.free(c.ptr[0..self.callbacks_capacity]);
+                        self.callbacks = null;
+                        self.callbacks_capacity = 0;
+                    }
                 }
 
                 /// Attaches a callback to the instrument.
@@ -117,14 +122,23 @@ pub fn ObservableInstrument(K: Kind) type {
                     defer self.lock.unlock(self.io);
 
                     if (self.callbacks) |c| {
-                        var new_callbacks = try self.allocator.alloc(ObserveMeasures, c.len + 1);
-                        std.mem.copyForwards(ObserveMeasures, new_callbacks, c);
-                        new_callbacks[c.len] = callback;
-                        self.callbacks = new_callbacks;
-                        self.allocator.free(c);
+                        if (c.len < self.callbacks_capacity) {
+                            c.ptr[c.len] = callback;
+                            self.callbacks = c.ptr[0 .. c.len + 1];
+                        } else {
+                            const new_capacity = c.len + 1;
+                            const new_callbacks = try self.allocator.alloc(ObserveMeasures, new_capacity);
+                            std.mem.copyForwards(ObserveMeasures, new_callbacks[0..c.len], c);
+                            new_callbacks[c.len] = callback;
+                            self.allocator.free(c.ptr[0..self.callbacks_capacity]);
+                            self.callbacks = new_callbacks;
+                            self.callbacks_capacity = new_capacity;
+                        }
                     } else {
-                        self.callbacks = try self.allocator.alloc(ObserveMeasures, 1);
-                        self.callbacks.?[0] = callback;
+                        const new_callbacks = try self.allocator.alloc(ObserveMeasures, 1);
+                        new_callbacks[0] = callback;
+                        self.callbacks = new_callbacks;
+                        self.callbacks_capacity = 1;
                     }
                 }
 
@@ -146,24 +160,17 @@ pub fn ObservableInstrument(K: Kind) type {
 
                     const idx = found_idx orelse return false;
                     if (c.len == 1) {
-                        self.allocator.free(c);
+                        self.allocator.free(c.ptr[0..self.callbacks_capacity]);
                         self.callbacks = null;
+                        self.callbacks_capacity = 0;
                         return true;
                     }
 
-                    if (self.allocator.alloc(ObserveMeasures, c.len - 1)) |new_callbacks| {
-                        std.mem.copyForwards(ObserveMeasures, new_callbacks[0..idx], c[0..idx]);
-                        std.mem.copyForwards(ObserveMeasures, new_callbacks[idx..], c[idx + 1 ..]);
-                        self.callbacks = new_callbacks;
-                        self.allocator.free(c);
-                        return true;
-                    } else |_| {
-                        for (idx..c.len - 1) |i| {
-                            c[i] = c[i + 1];
-                        }
-                        self.callbacks = c[0 .. c.len - 1];
-                        return true;
+                    for (idx..c.len - 1) |i| {
+                        c[i] = c[i + 1];
                     }
+                    self.callbacks = c.ptr[0 .. c.len - 1];
+                    return true;
                 }
 
                 fn observe(self: *Self, allocator: std.mem.Allocator) MetricObserveError!?MeasurementsData {
@@ -413,4 +420,63 @@ test "observable instrument unregisterCallback" {
     // Unregistering a non-present callback returns false and leaves list intact
     try std.testing.expect(!instrument.unregisterCallback(dummyCallback));
     try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
+}
+
+test "observable instrument unregisterCallback with failing allocator cleanup" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    const io = std.testing.io;
+
+    const instrument = try allocator.create(ObservableInstrument(.ObservableCounter));
+    defer allocator.destroy(instrument);
+
+    instrument.* = ObservableInstrument(.ObservableCounter).init(allocator, io, null);
+    defer instrument.deinit();
+
+    try instrument.registerCallback(testCallback);
+    const dummyCallback: ObserveMeasures = testCallbackWithAttrs;
+    try instrument.registerCallback(dummyCallback);
+
+    // Disallow any further allocations
+    failing.fail_index = failing.alloc_index;
+
+    // Unregistering should not require allocation and should preserve capacity
+    try std.testing.expect(instrument.unregisterCallback(testCallback));
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
+    try std.testing.expect(instrument.callbacks.?[0] == dummyCallback);
+
+    // Registering within remaining capacity should succeed without allocating
+    try instrument.registerCallback(testCallback);
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
+
+    // Unregister back to 1 callback
+    try std.testing.expect(instrument.unregisterCallback(dummyCallback));
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
+
+    // defer instrument.deinit() will free using the tracked allocation capacity,
+    // which must match the original allocation size without violating the allocator contract.
+}
+
+test "observable instrument unregisterCallback to empty with failing allocator" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+    const io = std.testing.io;
+
+    const instrument = try allocator.create(ObservableInstrument(.ObservableCounter));
+    defer allocator.destroy(instrument);
+
+    instrument.* = ObservableInstrument(.ObservableCounter).init(allocator, io, null);
+    defer instrument.deinit();
+
+    try instrument.registerCallback(testCallback);
+    try instrument.registerCallback(testCallbackWithAttrs);
+
+    // Disallow any further allocations
+    failing.fail_index = failing.alloc_index;
+
+    // Unregister first callback
+    try std.testing.expect(instrument.unregisterCallback(testCallback));
+    // Unregister last callback - frees backing storage and clears capacity without allocating
+    try std.testing.expect(instrument.unregisterCallback(testCallbackWithAttrs));
+    try std.testing.expect(instrument.callbacks == null);
 }
