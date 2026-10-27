@@ -128,6 +128,44 @@ pub fn ObservableInstrument(K: Kind) type {
                     }
                 }
 
+                /// Removes a previously registered callback from the instrument.
+                /// If the callback was not found, this is a no-op and returns false.
+                /// Returns true if the callback was found and successfully removed.
+                pub fn unregisterCallback(self: *Self, callback: ObserveMeasures) bool {
+                    self.lock.lockUncancelable(self.io);
+                    defer self.lock.unlock(self.io);
+
+                    const c = self.callbacks orelse return false;
+                    var found_idx: ?usize = null;
+                    for (c, 0..) |cb, idx| {
+                        if (cb == callback) {
+                            found_idx = idx;
+                            break;
+                        }
+                    }
+
+                    const idx = found_idx orelse return false;
+                    if (c.len == 1) {
+                        self.allocator.free(c);
+                        self.callbacks = null;
+                        return true;
+                    }
+
+                    if (self.allocator.alloc(ObserveMeasures, c.len - 1)) |new_callbacks| {
+                        std.mem.copyForwards(ObserveMeasures, new_callbacks[0..idx], c[0..idx]);
+                        std.mem.copyForwards(ObserveMeasures, new_callbacks[idx..], c[idx + 1 ..]);
+                        self.callbacks = new_callbacks;
+                        self.allocator.free(c);
+                        return true;
+                    } else |_| {
+                        for (idx..c.len - 1) |i| {
+                            c[i] = c[i + 1];
+                        }
+                        self.callbacks = c[0 .. c.len - 1];
+                        return true;
+                    }
+                }
+
                 fn observe(self: *Self, allocator: std.mem.Allocator) MetricObserveError!?MeasurementsData {
                     self.lock.lockUncancelable(self.io);
                     defer self.lock.unlock(self.io);
@@ -332,4 +370,47 @@ test "observable instrument e2e measurements with context" {
     defer data.deinit(allocator);
 
     try std.testing.expectEqual(1, data.int.len);
+}
+
+test "observable instrument unregisterCallback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const instrument = try allocator.create(ObservableInstrument(.ObservableCounter));
+    defer allocator.destroy(instrument);
+
+    instrument.* = ObservableInstrument(.ObservableCounter).init(allocator, io, null);
+    defer instrument.deinit();
+
+    // Unregistering when no callbacks exist returns false
+    try std.testing.expect(!instrument.unregisterCallback(testCallback));
+
+    // Register a callback
+    try instrument.registerCallback(testCallback);
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
+
+    // Unregister the callback
+    try std.testing.expect(instrument.unregisterCallback(testCallback));
+    try std.testing.expect(instrument.callbacks == null);
+
+    // Unregistering again returns false
+    try std.testing.expect(!instrument.unregisterCallback(testCallback));
+
+    // Test with multiple callbacks: register 3 callbacks and remove the middle one
+    const dummyCallback: ObserveMeasures = testCallbackWithAttrs;
+    try instrument.registerCallback(testCallback);
+    try instrument.registerCallback(dummyCallback);
+    try instrument.registerCallback(testCallback);
+
+    try std.testing.expectEqual(@as(usize, 3), instrument.callbacks.?.len);
+
+    // Remove dummyCallback
+    try std.testing.expect(instrument.unregisterCallback(dummyCallback));
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
+    try std.testing.expect(instrument.callbacks.?[0] == testCallback);
+    try std.testing.expect(instrument.callbacks.?[1] == testCallback);
+
+    // Unregistering a non-present callback returns false and leaves list intact
+    try std.testing.expect(!instrument.unregisterCallback(dummyCallback));
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
 }
