@@ -431,7 +431,10 @@ pub const BatchingProcessor = struct {
 
         try result.links.ensureTotalCapacity(allocator, span.links.items.len);
         for (span.links.items) |link| {
-            var cloned_link = trace.Span.Link.init(allocator, link.span_context);
+            var link_context = link.span_context;
+            link_context.trace_state = try link.span_context.trace_state.clone(allocator);
+            var cloned_link = trace.Span.Link.init(allocator, link_context);
+            cloned_link.owns_trace_state = true;
             errdefer cloned_link.deinit();
             cloned_link.attributes = try cloneAttributes(allocator, link.attributes);
             result.links.appendAssumeCapacity(cloned_link);
@@ -872,4 +875,40 @@ test "BatchingProcessor cloneSpan preserves resource" {
     try std.testing.expect(queued.resource != null);
     try std.testing.expectEqualStrings("service.name", queued.resource.?[0].key);
     try std.testing.expectEqualStrings("test-service", queued.resource.?[0].value.string);
+}
+
+test "BatchingProcessor queued span owns its links TraceState" {
+    const allocator = std.testing.allocator;
+
+    var empty = trace.TraceState.init(allocator);
+    defer empty.deinit();
+    var link_trace_state = try empty.insert(allocator, "congo", "l2938");
+
+    const link_context = trace.SpanContext.init(
+        trace.TraceID.init([16]u8{ 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 }),
+        trace.SpanID.init([8]u8{ 8, 8, 8, 8, 8, 8, 8, 8 }),
+        trace.TraceFlags.sampled(),
+        link_trace_state,
+        false,
+    );
+
+    const span_context = trace.SpanContext.init(
+        trace.TraceID.init([16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 }),
+        trace.SpanID.init([8]u8{ 1, 2, 3, 4, 5, 6, 7, 8 }),
+        trace.TraceFlags.sampled(),
+        trace.TraceState.init(allocator),
+        false,
+    );
+    var span = trace.Span.init(allocator, span_context, "test-span", .Internal, .{ .name = "test" });
+    try span.addLink(link_context, null);
+
+    var queued = try BatchingProcessor.cloneSpan(allocator, span);
+    defer queued.deinit();
+
+    // Release the original span and its link's TraceState before reading the queued copy
+    span.deinit();
+    link_trace_state.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), queued.links.items.len);
+    try std.testing.expectEqualStrings("l2938", queued.links.items[0].span_context.trace_state.get("congo").?);
 }

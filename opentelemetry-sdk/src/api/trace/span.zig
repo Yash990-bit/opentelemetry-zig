@@ -291,6 +291,9 @@ pub const Span = struct {
         span_context: SpanContext,
         attributes: StringArrayHashMap(attribute.AttributeValue),
         allocator: std.mem.Allocator,
+        /// True when `span_context.trace_state` was allocated for this link, e.g. by
+        /// BatchingProcessor.cloneSpan, and must be released by `deinit`
+        owns_trace_state: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, span_context: SpanContext) Link {
             return Link{
@@ -301,6 +304,10 @@ pub const Span = struct {
         }
 
         pub fn deinit(self: *Link) void {
+            if (self.owns_trace_state) {
+                self.span_context.trace_state.deinit();
+                self.owns_trace_state = false;
+            }
             self.attributes.deinit(self.allocator);
         }
     };
