@@ -92,24 +92,20 @@ pub fn ObservableInstrument(K: Kind) type {
                 lock: std.Io.Mutex = .init,
                 /// List of functions that will produce data points when called.
                 /// Functions are called by the Meter when it observes the instrument (e.g. when Metricreader collects metrics).
-                callbacks: ?[]ObserveMeasures = null,
-                callbacks_capacity: usize = 0,
+                callbacks: std.ArrayList(ObserveMeasures) = .empty,
                 context: ObservedContext,
 
                 pub fn init(allocator: std.mem.Allocator, io: std.Io, ctx: ?ObservedContext) Self {
                     return Self{
                         .allocator = allocator,
                         .io = io,
+                        .callbacks = .empty,
                         .context = ctx orelse .{},
                     };
                 }
 
                 pub fn deinit(self: *Self) void {
-                    if (self.callbacks) |c| {
-                        self.allocator.free(c.ptr[0..self.callbacks_capacity]);
-                        self.callbacks = null;
-                        self.callbacks_capacity = 0;
-                    }
+                    self.callbacks.deinit(self.allocator);
                 }
 
                 /// Attaches a callback to the instrument.
@@ -121,25 +117,7 @@ pub fn ObservableInstrument(K: Kind) type {
                     self.lock.lockUncancelable(self.io);
                     defer self.lock.unlock(self.io);
 
-                    if (self.callbacks) |c| {
-                        if (c.len < self.callbacks_capacity) {
-                            c.ptr[c.len] = callback;
-                            self.callbacks = c.ptr[0 .. c.len + 1];
-                        } else {
-                            const new_capacity = c.len + 1;
-                            const new_callbacks = try self.allocator.alloc(ObserveMeasures, new_capacity);
-                            std.mem.copyForwards(ObserveMeasures, new_callbacks[0..c.len], c);
-                            new_callbacks[c.len] = callback;
-                            self.allocator.free(c.ptr[0..self.callbacks_capacity]);
-                            self.callbacks = new_callbacks;
-                            self.callbacks_capacity = new_capacity;
-                        }
-                    } else {
-                        const new_callbacks = try self.allocator.alloc(ObserveMeasures, 1);
-                        new_callbacks[0] = callback;
-                        self.callbacks = new_callbacks;
-                        self.callbacks_capacity = 1;
-                    }
+                    try self.callbacks.append(self.allocator, callback);
                 }
 
                 /// Removes a previously registered callback from the instrument.
@@ -149,78 +127,62 @@ pub fn ObservableInstrument(K: Kind) type {
                     self.lock.lockUncancelable(self.io);
                     defer self.lock.unlock(self.io);
 
-                    const c = self.callbacks orelse return false;
-                    var found_idx: ?usize = null;
-                    for (c, 0..) |cb, idx| {
+                    for (self.callbacks.items, 0..) |cb, idx| {
                         if (cb == callback) {
-                            found_idx = idx;
-                            break;
+                            _ = self.callbacks.orderedRemove(idx);
+                            return true;
                         }
                     }
-
-                    const idx = found_idx orelse return false;
-                    if (c.len == 1) {
-                        self.allocator.free(c.ptr[0..self.callbacks_capacity]);
-                        self.callbacks = null;
-                        self.callbacks_capacity = 0;
-                        return true;
-                    }
-
-                    for (idx..c.len - 1) |i| {
-                        c[i] = c[i + 1];
-                    }
-                    self.callbacks = c.ptr[0 .. c.len - 1];
-                    return true;
+                    return false;
                 }
 
                 fn observe(self: *Self, allocator: std.mem.Allocator) MetricObserveError!?MeasurementsData {
                     self.lock.lockUncancelable(self.io);
                     defer self.lock.unlock(self.io);
 
-                    if (self.callbacks) |c| {
-                        var m = try allocator.alloc(MeasurementsData, c.len);
-                        defer allocator.free(m);
+                    if (self.callbacks.items.len == 0) return null;
 
-                        for (c, 0..) |callback, idx| {
-                            var result = try callback(self.context, allocator);
-                            // If we encounter an error while observing, we need to clear the memory allocated for the current
-                            // callback execution, as well as the previously allocated measurements.
-                            // A failure in one callback affects all the others.
-                            errdefer {
-                                result.deinit(allocator);
-                                for (m[0..idx]) |*mes| {
-                                    mes.deinit(allocator);
-                                }
-                            }
-                            // We need to ensure that all callbacks return the same type of data points,
-                            // because we are merging them into a single MeasurementsData.
-                            if (idx > 0) {
-                                if (std.meta.activeTag(result) != std.meta.activeTag(m[idx - 1])) {
-                                    return MetricObserveError.NonUniformMeasurementsDataType;
-                                }
-                            }
-                            switch (result) {
-                                .int, .double => {},
-                                else => return MetricObserveError.UnsupportedDataPointTypeReturnedByCallback,
-                            }
-                            m[idx] = result;
-                        }
+                    var m = try allocator.alloc(MeasurementsData, self.callbacks.items.len);
+                    defer allocator.free(m);
 
-                        // Join all data points from the callbacks into a single MeasurementsData.
-                        // We need to find first the type of data points we are dealing with.
-                        var uniqueData: MeasurementsData = m[0];
-                        if (m.len > 1) {
-                            for (1..m.len) |i| {
-                                try uniqueData.join(m[i], allocator);
+                    for (self.callbacks.items, 0..) |callback, idx| {
+                        var result = try callback(self.context, allocator);
+                        // If we encounter an error while observing, we need to clear the memory allocated for the current
+                        // callback execution, as well as the previously allocated measurements.
+                        // A failure in one callback affects all the others.
+                        errdefer {
+                            result.deinit(allocator);
+                            for (m[0..idx]) |*mes| {
+                                mes.deinit(allocator);
                             }
                         }
-
-                        // De-duplicate data points with the same attributes.
-                        try uniqueData.dedupByAttributes(allocator);
-
-                        return uniqueData;
+                        // We need to ensure that all callbacks return the same type of data points,
+                        // because we are merging them into a single MeasurementsData.
+                        if (idx > 0) {
+                            if (std.meta.activeTag(result) != std.meta.activeTag(m[idx - 1])) {
+                                return MetricObserveError.NonUniformMeasurementsDataType;
+                            }
+                        }
+                        switch (result) {
+                            .int, .double => {},
+                            else => return MetricObserveError.UnsupportedDataPointTypeReturnedByCallback,
+                        }
+                        m[idx] = result;
                     }
-                    return null; // No callbacks registered, nothing to observe.
+
+                    // Join all data points from the callbacks into a single MeasurementsData.
+                    // We need to find first the type of data points we are dealing with.
+                    var uniqueData: MeasurementsData = m[0];
+                    if (m.len > 1) {
+                        for (1..m.len) |i| {
+                            try uniqueData.join(m[i], allocator);
+                        }
+                    }
+
+                    // De-duplicate data points with the same attributes.
+                    try uniqueData.dedupByAttributes(allocator);
+
+                    return uniqueData;
                 }
 
                 /// Observes the instrument and returns the measurements collected by the callbacks.
@@ -251,7 +213,7 @@ test ObservableInstrument {
     defer instrument.deinit();
 
     try instrument.registerCallback(testCallback);
-    try std.testing.expect(instrument.callbacks.?[0] == testCallback);
+    try std.testing.expect(instrument.callbacks.items[0] == testCallback);
 }
 
 test "observable instrument with multiple callbacks" {
@@ -268,8 +230,8 @@ test "observable instrument with multiple callbacks" {
     try instrument.registerCallback(testCallback);
     try instrument.registerCallback(anotherCallback);
 
-    try std.testing.expect(instrument.callbacks.?[0] == testCallback);
-    try std.testing.expect(instrument.callbacks.?[1] == anotherCallback);
+    try std.testing.expect(instrument.callbacks.items[0] == testCallback);
+    try std.testing.expect(instrument.callbacks.items[1] == anotherCallback);
 }
 
 fn testCallbackWithAttrs(_: ObservedContext, allocator: std.mem.Allocator) MetricObserveError!MeasurementsData {
@@ -394,11 +356,11 @@ test "observable instrument unregisterCallback" {
 
     // Register a callback
     try instrument.registerCallback(testCallback);
-    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.items.len);
 
     // Unregister the callback
     try std.testing.expect(instrument.unregisterCallback(testCallback));
-    try std.testing.expect(instrument.callbacks == null);
+    try std.testing.expectEqual(@as(usize, 0), instrument.callbacks.items.len);
 
     // Unregistering again returns false
     try std.testing.expect(!instrument.unregisterCallback(testCallback));
@@ -409,17 +371,17 @@ test "observable instrument unregisterCallback" {
     try instrument.registerCallback(dummyCallback);
     try instrument.registerCallback(testCallback);
 
-    try std.testing.expectEqual(@as(usize, 3), instrument.callbacks.?.len);
+    try std.testing.expectEqual(@as(usize, 3), instrument.callbacks.items.len);
 
     // Remove dummyCallback
     try std.testing.expect(instrument.unregisterCallback(dummyCallback));
-    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
-    try std.testing.expect(instrument.callbacks.?[0] == testCallback);
-    try std.testing.expect(instrument.callbacks.?[1] == testCallback);
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.items.len);
+    try std.testing.expect(instrument.callbacks.items[0] == testCallback);
+    try std.testing.expect(instrument.callbacks.items[1] == testCallback);
 
     // Unregistering a non-present callback returns false and leaves list intact
     try std.testing.expect(!instrument.unregisterCallback(dummyCallback));
-    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.items.len);
 }
 
 test "observable instrument unregisterCallback with failing allocator cleanup" {
@@ -442,19 +404,16 @@ test "observable instrument unregisterCallback with failing allocator cleanup" {
 
     // Unregistering should not require allocation and should preserve capacity
     try std.testing.expect(instrument.unregisterCallback(testCallback));
-    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
-    try std.testing.expect(instrument.callbacks.?[0] == dummyCallback);
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.items.len);
+    try std.testing.expect(instrument.callbacks.items[0] == dummyCallback);
 
     // Registering within remaining capacity should succeed without allocating
     try instrument.registerCallback(testCallback);
-    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.?.len);
+    try std.testing.expectEqual(@as(usize, 2), instrument.callbacks.items.len);
 
     // Unregister back to 1 callback
     try std.testing.expect(instrument.unregisterCallback(dummyCallback));
-    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.?.len);
-
-    // defer instrument.deinit() will free using the tracked allocation capacity,
-    // which must match the original allocation size without violating the allocator contract.
+    try std.testing.expectEqual(@as(usize, 1), instrument.callbacks.items.len);
 }
 
 test "observable instrument unregisterCallback to empty with failing allocator" {
@@ -476,7 +435,7 @@ test "observable instrument unregisterCallback to empty with failing allocator" 
 
     // Unregister first callback
     try std.testing.expect(instrument.unregisterCallback(testCallback));
-    // Unregister last callback - frees backing storage and clears capacity without allocating
+    // Unregister last callback without allocating
     try std.testing.expect(instrument.unregisterCallback(testCallbackWithAttrs));
-    try std.testing.expect(instrument.callbacks == null);
+    try std.testing.expectEqual(@as(usize, 0), instrument.callbacks.items.len);
 }
