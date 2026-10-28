@@ -356,17 +356,18 @@ pub const Baggage = struct {
 
 // Context integration
 
-/// Thread-local storage for the baggage key
-threadlocal var baggage_key: ?context.ContextKey = null;
+/// Process-wide storage for the baggage context key ID
+var baggage_key_id: std.atomic.Value(usize) = .init(0);
 
 /// Get or create the Baggage context key
 fn getBaggageKey() context.ContextKey {
-    if (baggage_key) |key| {
-        return key;
+    var id = baggage_key_id.load(.acquire);
+    if (id == 0) {
+        const key = context.createKey("opentelemetry.baggage");
+        _ = baggage_key_id.cmpxchgStrong(0, key.id, .release, .acquire);
+        id = baggage_key_id.load(.acquire);
     }
-    const key = context.createKey("opentelemetry.baggage");
-    baggage_key = key;
-    return key;
+    return .{ .id = id, .name = "opentelemetry.baggage" };
 }
 
 /// Extract Baggage from a Context instance.
@@ -748,4 +749,33 @@ test "baggage setValue memory safety with allocator" {
     try std.testing.expectEqualStrings("new_meta", bag.getValue("k1").?.metadata.?);
 
     // If there are any leaks, std.testing.allocator will catch them when we deinit
+}
+
+test "baggage cross-thread context extraction" {
+    const allocator = std.testing.allocator;
+
+    var bag = Baggage.init();
+    try bag.setValue(allocator, "user_id", "alice", null);
+    defer bag.deinit();
+
+    var ctx = try insertBaggage(allocator, bag);
+    defer ctx.deinit();
+
+    const Worker = struct {
+        fn run(c: context.Context, matched: *std.atomic.Value(bool)) void {
+            if (extractBaggage(c)) |extracted| {
+                if (extracted.getValue("user_id")) |entry| {
+                    if (std.mem.eql(u8, entry.value, "alice")) {
+                        matched.store(true, .seq_cst);
+                    }
+                }
+            }
+        }
+    };
+
+    var matched = std.atomic.Value(bool).init(false);
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ ctx, &matched });
+    thread.join();
+
+    try std.testing.expect(matched.load(.seq_cst));
 }
