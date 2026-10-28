@@ -88,23 +88,49 @@ pub fn freeResource(allocator: std.mem.Allocator, resource: []const Attribute) v
     allocator.free(resource);
 }
 
+fn containsAttributeKey(slice: []const Attribute, key: []const u8) bool {
+    for (slice) |attr| {
+        if (std.mem.eql(u8, attr.key, key)) return true;
+    }
+    return false;
+}
+
 /// Merge two resource attribute slices into a new one.
-/// Caller is responsible for freeing the returned slice.
+/// If a key exists in both slices, the attribute from res1 takes precedence.
+/// Caller is responsible for freeing the returned slice with freeResource.
 pub fn mergeResources(
     allocator: std.mem.Allocator,
     res1: []const Attribute,
     res2: []const Attribute,
 ) !?[]Attribute {
     var merged: std.ArrayList(Attribute) = try .initCapacity(allocator, res1.len + res2.len);
-    errdefer merged.deinit(allocator);
+    errdefer {
+        for (merged.items) |attr| {
+            allocator.free(attr.key);
+            if (attr.value == .string) {
+                allocator.free(attr.value.string);
+            }
+        }
+        merged.deinit(allocator);
+    }
 
     for (res1) |attr| {
-        merged.appendAssumeCapacity(try Attribute.dupe(allocator, attr));
+        if (!containsAttributeKey(merged.items, attr.key)) {
+            merged.appendAssumeCapacity(try Attribute.dupe(allocator, attr));
+        }
     }
     for (res2) |attr| {
-        merged.appendAssumeCapacity(try Attribute.dupe(allocator, attr));
+        if (!containsAttributeKey(merged.items, attr.key)) {
+            merged.appendAssumeCapacity(try Attribute.dupe(allocator, attr));
+        }
     }
-    if (merged.items.len > 0) return try merged.toOwnedSlice(allocator) else return null;
+
+    if (merged.items.len > 0) {
+        return try merged.toOwnedSlice(allocator);
+    } else {
+        merged.deinit(allocator);
+        return null;
+    }
 }
 
 test "buildFromConfig with service name only" {
@@ -328,4 +354,79 @@ test "service.name defaults to unknown_service when nothing is configured" {
     try std.testing.expectEqual(@as(usize, 1), resource.len);
     try std.testing.expectEqualStrings("service.name", resource[0].key);
     try std.testing.expect(std.mem.startsWith(u8, resource[0].value.string, "unknown_service"));
+}
+
+test "mergeResources with distinct attributes" {
+    const allocator = std.testing.allocator;
+
+    const res1 = [_]Attribute{
+        .{ .key = "service.name", .value = .{ .string = "auth-service" } },
+        .{ .key = "service.version", .value = .{ .string = "1.0.0" } },
+    };
+    const res2 = [_]Attribute{
+        .{ .key = "deployment.environment", .value = .{ .string = "production" } },
+    };
+
+    const merged = (try mergeResources(allocator, &res1, &res2)).?;
+    defer freeResource(allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("service.name", merged[0].key);
+    try std.testing.expectEqualStrings("auth-service", merged[0].value.string);
+    try std.testing.expectEqualStrings("service.version", merged[1].key);
+    try std.testing.expectEqualStrings("1.0.0", merged[1].value.string);
+    try std.testing.expectEqualStrings("deployment.environment", merged[2].key);
+    try std.testing.expectEqualStrings("production", merged[2].value.string);
+}
+
+test "mergeResources deduplicates keys with res1 precedence" {
+    const allocator = std.testing.allocator;
+
+    const res1 = [_]Attribute{
+        .{ .key = "service.name", .value = .{ .string = "custom-service" } },
+        .{ .key = "host.name", .value = .{ .string = "primary-host" } },
+    };
+    const res2 = [_]Attribute{
+        .{ .key = "service.name", .value = .{ .string = "default-service" } },
+        .{ .key = "region", .value = .{ .string = "us-east-1" } },
+    };
+
+    const merged = (try mergeResources(allocator, &res1, &res2)).?;
+    defer freeResource(allocator, merged);
+
+    try std.testing.expectEqual(@as(usize, 3), merged.len);
+    try std.testing.expectEqualStrings("service.name", merged[0].key);
+    try std.testing.expectEqualStrings("custom-service", merged[0].value.string);
+    try std.testing.expectEqualStrings("host.name", merged[1].key);
+    try std.testing.expectEqualStrings("primary-host", merged[1].value.string);
+    try std.testing.expectEqualStrings("region", merged[2].key);
+    try std.testing.expectEqualStrings("us-east-1", merged[2].value.string);
+}
+
+test "mergeResources with empty inputs" {
+    const allocator = std.testing.allocator;
+
+    const empty: []const Attribute = &.{};
+    const merged = try mergeResources(allocator, empty, empty);
+    try std.testing.expect(merged == null);
+}
+
+test "mergeResources cleanup on allocation failure does not leak" {
+    const res1 = [_]Attribute{
+        .{ .key = "k1", .value = .{ .string = "v1" } },
+        .{ .key = "k2", .value = .{ .string = "v2" } },
+    };
+    const res2 = [_]Attribute{
+        .{ .key = "k3", .value = .{ .string = "v3" } },
+    };
+
+    // Test failure at each allocation step to verify no memory leak occurs
+    for (1..7) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+            .fail_index = fail_index,
+        });
+        const allocator = failing.allocator();
+
+        _ = mergeResources(allocator, &res1, &res2) catch {};
+    }
 }
