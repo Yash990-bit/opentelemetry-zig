@@ -185,7 +185,7 @@ pub const CompositePropagator = struct {
         }
 
         if (self.registry.baggage_enabled) {
-            try field_list.append(self.allocator, baggage_propagator.baggage_header);
+            try field_list.appendSlice(self.allocator, baggage_propagator.fields());
         }
 
         return try field_list.toOwnedSlice(self.allocator);

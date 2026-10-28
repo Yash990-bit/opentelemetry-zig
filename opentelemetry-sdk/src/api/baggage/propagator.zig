@@ -31,6 +31,11 @@ pub const baggage_header = "baggage";
 /// Environment variable name for baggage
 pub const baggage_env_var = "BAGGAGE";
 
+/// Fields read and written by this propagator
+pub fn fields() []const []const u8 {
+    return &.{baggage_header};
+}
+
 /// URL-encode a string according to RFC 3986.
 fn urlEncode(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result: std.ArrayList(u8) = .empty;
@@ -94,10 +99,28 @@ pub fn inject(
     carrier: anytype,
     setter: propagator.TextMapSetter(@TypeOf(carrier.*)),
 ) !void {
+    return injectWithKey(allocator, baggage, carrier, setter, baggage_header);
+}
+
+fn injectWithKey(
+    allocator: std.mem.Allocator,
+    baggage: Baggage,
+    carrier: anytype,
+    setter: propagator.TextMapSetter(@TypeOf(carrier.*)),
+    key: []const u8,
+) !void {
     if (baggage.count() == 0) {
         return; // Nothing to inject
     }
 
+    const owned_slice = try formatBaggage(allocator, baggage);
+    setter.set(carrier, key, owned_slice) catch |err| {
+        allocator.free(owned_slice);
+        return err;
+    };
+}
+
+fn formatBaggage(allocator: std.mem.Allocator, baggage: Baggage) ![]u8 {
     var header_value: std.ArrayList(u8) = .empty;
     errdefer header_value.deinit(allocator);
 
@@ -126,8 +149,7 @@ pub fn inject(
         }
     }
 
-    const owned_slice = try header_value.toOwnedSlice(allocator);
-    try setter.set(carrier, baggage_header, owned_slice);
+    return try header_value.toOwnedSlice(allocator);
 }
 
 /// Extract baggage from a carrier using the W3C Baggage format.
@@ -148,7 +170,10 @@ pub fn extract(
     getter: propagator.TextMapGetter(@TypeOf(carrier.*)),
 ) !?Baggage {
     const header_value = getter.get(carrier, baggage_header) orelse return null;
+    return try parseBaggageHeader(allocator, header_value);
+}
 
+fn parseBaggageHeader(allocator: std.mem.Allocator, header_value: []const u8) !?Baggage {
     if (header_value.len == 0) {
         return Baggage.init();
     }
@@ -242,7 +267,8 @@ pub const EnvSetter = propagator.TextMapSetter(EnvMap){
 /// ## Errors
 /// - `OutOfMemory`: If allocation fails during extraction
 pub fn extractFromEnvironment(allocator: std.mem.Allocator, env_map: *const EnvMap) !?Baggage {
-    return try extract(allocator, env_map, EnvGetter);
+    const header_value = env_map.get(baggage_env_var) orelse return null;
+    return try parseBaggageHeader(allocator, header_value);
 }
 
 /// Inject baggage into an environment map.
@@ -252,7 +278,7 @@ pub fn extractFromEnvironment(allocator: std.mem.Allocator, env_map: *const EnvM
 /// ## Parameters
 /// - `allocator`: Memory allocator for encoding
 /// - `baggage`: The Baggage to inject
-/// - `env`: The environment map to inject into
+/// - `env_map`: The environment map to inject into
 ///
 /// ## Errors
 /// - `OutOfMemory`: If allocation fails during encoding
@@ -261,7 +287,10 @@ pub fn injectIntoEnvironment(
     baggage: Baggage,
     env_map: *EnvMap,
 ) !void {
-    try inject(allocator, baggage, env_map, EnvSetter);
+    if (baggage.count() == 0) return;
+    const value = try formatBaggage(allocator, baggage);
+    defer allocator.free(value);
+    try env_map.put(baggage_env_var, value);
 }
 
 // Tests
@@ -550,4 +579,37 @@ test "inject empty baggage does nothing" {
     try inject(allocator, baggage, &headers, HttpSetter);
 
     try std.testing.expect(headers.get("baggage") == null);
+}
+
+test "propagator fields" {
+    const f = fields();
+    try std.testing.expectEqual(@as(usize, 1), f.len);
+    try std.testing.expectEqualStrings("baggage", f[0]);
+}
+
+test "inject and extract baggage with environment variables" {
+    const allocator = std.testing.allocator;
+
+    var baggage = Baggage.init();
+    try baggage.setValue(allocator, "user_id", "alice", null);
+    try baggage.setValue(allocator, "plan", "pro", "level=1");
+    defer baggage.deinit();
+
+    var env_map = EnvMap.init(allocator);
+    defer env_map.deinit();
+
+    try injectIntoEnvironment(allocator, baggage, &env_map);
+
+    // BAGGAGE should be set, but lowercase "baggage" should not
+    try std.testing.expect(env_map.get("BAGGAGE") != null);
+    try std.testing.expect(env_map.get("baggage") == null);
+
+    // Extract from environment
+    var extracted = (try extractFromEnvironment(allocator, &env_map)).?;
+    defer extracted.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), extracted.count());
+    try std.testing.expectEqualStrings("alice", extracted.getValue("user_id").?.value);
+    try std.testing.expectEqualStrings("pro", extracted.getValue("plan").?.value);
+    try std.testing.expectEqualStrings("level=1", extracted.getValue("plan").?.metadata.?);
 }
